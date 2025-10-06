@@ -26,6 +26,8 @@ import traceback
 from collections import deque
 from datetime import datetime, time as dt_time, timedelta
 from typing import Any, Dict, List, Optional, Tuple
+from enhanced_ai_trading import enhance_existing_analysis
+from Candlestick_Patterns import CandlestickPatternRecognizer
 
 # NEW: Import AgentEngine for AGENTS.md integration
 from agent_engine import AgentEngine
@@ -64,7 +66,7 @@ def load_config():
         logger.info("✅ Configuration loaded from config.yaml")
         return config
     except Exception as e:
-        logger.warning(f"⚠️ Could not load config.yaml: {e}. Using default configuration.")
+        logger.warning("⚠️ Could not load config.yaml: {e}. Using default configuration.")
         # Default configuration
         return {
             'symbol': 'NIFTY',
@@ -219,6 +221,10 @@ class EnhancedGodBotWithAI:
         self.market_state = EnhancedMarketState(self.symbol, self.config)
         self.candle_system = CandleIntelligenceSystem()
         self.timeframe_analyzer = MultiTimeframeAnalyzer()
+        # Candlestick pattern recognition
+        self.pattern_recognizer = CandlestickPatternRecognizer()
+        self.completed_candles = []
+
         # ... all your existing initialization ...
         
         # NEW: Add Smart AI Bot as an advisor
@@ -1366,8 +1372,7 @@ class MultiTimeframeAnalyzer:
         # Analyze each timeframe
         for interval in self.intervals:
             # Calculate how many snapshots we need for this interval
-            required_snapshots = interval
-            
+            required_snapshots = max(2, interval // 3)            
             # Check if we have enough data
             if len(history_list) < required_snapshots:
                 logger.info(f"⏰ {interval}-MINUTE ANALYSIS: SKIPPED (insufficient data)")
@@ -1428,19 +1433,49 @@ class MultiTimeframeAnalyzer:
             # FIXED: Calculate PE OI percentage change
             pe_oi_change_pct = (pe_oi_change / start_pe_oi * 100) if start_pe_oi > 0 else 0
             
-            # Determine momentum based on price and OI changes
-            if spot_change_pct > 0.05 and ce_oi_change > pe_oi_change:
-                momentum = "BULLISH"
-                bullish_count += 1
-            elif spot_change_pct < -0.05 and pe_oi_change > ce_oi_change:
-                momentum = "BEARISH"
-                bearish_count += 1
+            # COMPLETELY FIXED: Enhanced momentum calculation with proper thresholds
+            base_threshold = 0.001  # 0.02% threshold (much more reasonable than 0.0003)
+            
+            # Calculate OI surge for dynamic threshold adjustment
+            total_oi_change = abs(ce_oi_change) + abs(pe_oi_change)
+            if total_oi_change > 100000:  # High OI activity
+                threshold = base_threshold * 0.7  # 0.014% for high activity
+            elif total_oi_change > 50000:  # Medium OI activity  
+                threshold = base_threshold * 0.85  # 0.017% for medium activity
+            else:
+                threshold = base_threshold  # 0.02% for normal activity
+            
+            abs_change = abs(spot_change_pct)
+            
+            # Calculate strength score first (needed for secondary check)
+            strength_score = min(10.0, abs(spot_change_pct) * 100)
+            
+            # Primary momentum check with corrected threshold
+            if abs_change >= threshold:
+                if spot_change_pct > 0 and ce_oi_change > pe_oi_change:
+                    momentum = "BULLISH"
+                    bullish_count += 1
+                elif spot_change_pct < 0 and pe_oi_change > ce_oi_change:
+                    momentum = "BEARISH"
+                    bearish_count += 1
+                elif spot_change_pct > 0:  # Any positive move above threshold
+                    momentum = "BULLISH"
+                    bullish_count += 1
+                else:  # Any negative move above threshold
+                    momentum = "BEARISH"
+                    bearish_count += 1
+            # Secondary: High strength score override (for strong signals)
+            elif strength_score > 6.0:
+                if spot_change_pct > 0:
+                    momentum = "BULLISH"  
+                    bullish_count += 1
+                else:
+                    momentum = "BEARISH"
+                    bearish_count += 1
+            # Only then sideways (for very small movements)
             else:
                 momentum = "SIDEWAYS"
                 sideways_count += 1
-            
-            # Calculate strength score (0-10)
-            strength_score = min(10.0, abs(spot_change_pct) * 100)
             
             # Track max price change
             max_price_change = max(max_price_change, abs(spot_change_pct))
@@ -1467,10 +1502,42 @@ class MultiTimeframeAnalyzer:
             logger.info(f"  📉 PE OI: {start_pe_oi:,.0f} → {end_pe_oi:,.0f} (Change: {pe_oi_change:,.0f}, {pe_oi_change_pct:+.2f}%)")
             logger.info(f"  🚀 Momentum: {momentum} | Strength: {strength_score:.2f}/10")
         
-        # Determine overall market state
-        if bullish_count > bearish_count and bullish_count > sideways_count:
+        # ENHANCED: Weighted market state calculation (fixes the BULLISH->SIDEWAYS issue)
+        timeframe_weights = {
+            3: 1.2, 9: 2.5, 15: 2.0, 21: 1.8, 25: 1.5, 30: 1.3,
+            33: 1.0, 39: 0.9, 45: 0.8, 50: 0.7, 55: 0.6, 
+            60: 0.5, 65: 0.4, 75: 0.3, 90: 0.2
+        }
+        
+        bullish_score = 0
+        bearish_score = 0
+        sideways_score = 0
+        
+        # Calculate weighted scores for each completed timeframe
+        for interval, data in timeframe_data.items():
+            if data.get('status') == 'COMPLETED':
+                weight = timeframe_weights.get(interval, 1.0)
+                strength = data.get('strength_score', 0) / 10  # Normalize to 0-1
+                momentum = data.get('momentum', 'SIDEWAYS')
+                
+                # Score = weight * (base + strength_bonus)
+                score = weight * (1 + strength)  # Boost by strength
+                
+                if momentum == 'BULLISH':
+                    bullish_score += score
+                elif momentum == 'BEARISH':
+                    bearish_score += score
+                else:  # SIDEWAYS gets reduced weight
+                    sideways_score += score * 0.5
+        
+        # Enhanced decision logic with bias towards continuing strong trends
+        if bullish_score > bearish_score * 1.3 and bullish_score > sideways_score:
             market_state = "BULLISH"
-        elif bearish_count > bullish_count and bearish_count > sideways_count:
+        elif bearish_score > bullish_score * 1.3 and bearish_score > sideways_score:
+            market_state = "BEARISH" 
+        elif bullish_score > bearish_score and bullish_score > sideways_score * 0.8:
+            market_state = "BULLISH"  # Favor continuing trends
+        elif bearish_score > bullish_score and bearish_score > sideways_score * 0.8:
             market_state = "BEARISH"
         else:
             market_state = "SIDEWAYS"
@@ -1484,12 +1551,16 @@ class MultiTimeframeAnalyzer:
             'bullish_count': bullish_count,
             'sideways_count': sideways_count,
             'avg_strength': avg_strength,
-            'max_price_change': max_price_change
+            'max_price_change': max_price_change,
+            'bullish_weighted_score': bullish_score,
+            'bearish_weighted_score': bearish_score,
+            'sideways_weighted_score': sideways_score
         }
         
         logger.info(f"🎯 CONSERVATIVE MARKET STATE: {market_state}")
         logger.info(f"📊 Analysis Summary: Bearish={bearish_count}, Bullish={bullish_count}, Sideways={sideways_count}")
         logger.info(f"📈 Max Price Change: {max_price_change:.4f}%, Avg Strength: {avg_strength:.2f}")
+        logger.info(f"⚖️  Weighted Scores: Bullish={bullish_score:.2f}, Bearish={bearish_score:.2f}, Sideways={sideways_score:.2f}")
         logger.info("✅ Timeframe analysis completed")
         
         # FIXED: Store the analysis results for later retrieval
@@ -1504,6 +1575,7 @@ class MultiTimeframeAnalyzer:
         self.last_analysis_results = result
         
         return result
+
 # =============================================================================
 # FIXED: display_15_timeframe_table function
 # =============================================================================
@@ -1554,11 +1626,19 @@ def display_15_timeframe_table(timeframe_analysis: Dict[str, Any]) -> None:
     
     print("-" * 120)
     
-    # Log summary
+    # Log summary with weighted scores
+    analysis_summary = timeframe_analysis.get('analysis_summary', {})
+    bullish_weighted = analysis_summary.get('bullish_weighted_score', 0)
+    bearish_weighted = analysis_summary.get('bearish_weighted_score', 0)
+    sideways_weighted = analysis_summary.get('sideways_weighted_score', 0)
+    
     logger.info(f"📊 15-Timeframe Analysis Summary: {completed_count} Completed, {15-completed_count} Pending")
     
+    if completed_count > 0:
+        logger.info(f"⚖️  Final Weighted Analysis: B={bullish_weighted:.2f} vs Bear={bearish_weighted:.2f} vs S={sideways_weighted:.2f}")
+    
     if completed_count == 0:
-        logger.warning(f"⚠️  No timeframes completed — waiting for sufficient market data")
+         logger.warning(f"⚠️  No timeframes completed — waiting for sufficient market data")
 
 # =============================================================================
 # FIXED: Enhanced market state update method
@@ -1612,6 +1692,30 @@ def update_market_state_with_timeframe(self, snapshot_data: Dict[str, Any]) -> D
     except Exception as e:
         self.error_count += 1
         logger.error(f"❌ Error updating market state for {self.symbol}: {e}")
+        # 🚀 AI ENHANCEMENT - Get advanced predictions  
+    try:
+        ai_result = enhance_existing_analysis(self, snapshot_data)
+        
+        if ai_result:
+            # Store AI results for access by other functions
+            self.current_analysis['ai_predictions'] = ai_result['ai_predictions']
+            self.current_analysis['support_resistance'] = ai_result['support_resistance']
+            self.current_analysis['market_regime'] = ai_result['market_regime']
+            self.current_analysis['trading_signals'] = ai_result['trading_signals']
+            
+            # Print AI insights immediately  
+            predictions = ai_result['ai_predictions']
+            print(f"🤖 AI PREDICTION: {predictions['5min_direction']} ({predictions['5min_confidence']:.1%})")
+            print(f"🎯 Expected Move: {predictions['expected_magnitude']:.1f} points")
+            print(f"⏰ Timing: {predictions['timing']}")
+            
+            # Add AI data to snapshot for downstream use
+            snapshot_data['ai_verdict'] = predictions['5min_direction']
+            snapshot_data['ai_confidence'] = predictions['5min_confidence']
+            
+    except Exception as ai_error:
+        logger.warning(f"AI enhancement failed: {ai_error}")
+
         return {}
 
 # =============================================================================
@@ -4307,40 +4411,10 @@ class EnhancedStrategyEngine:
             return {'signal': 'NEUTRAL', 'divergence_strength': 0, 'error': True}
     
     def analyze_market_snapshot(self, snapshot):
-        """Basic market snapshot analysis - fallback method."""
-        try:
-            analysis = {
-                'verdict': 'NEUTRAL',
-                'score': 5.0,
-                'reasoning': []
-            }
-            
-            # Basic PCR analysis
-            oi_pcr = snapshot.get('OI_PCR', 1.0)
-            vol_pcr = snapshot.get('VOL_PCR', 1.0)
-            
-            if oi_pcr > 1.2:
-                analysis['verdict'] = 'BULLISH'
-                analysis['score'] += 1.0
-                analysis['reasoning'].append(f"High OI PCR: {oi_pcr:.3f}")
-            elif oi_pcr < 0.8:
-                analysis['verdict'] = 'BEARISH'
-                analysis['score'] += 1.0
-                analysis['reasoning'].append(f"Low OI PCR: {oi_pcr:.3f}")
-            
-            if vol_pcr > 1.2:
-                if analysis['verdict'] == 'BULLISH':
-                    analysis['score'] += 0.5
-                analysis['reasoning'].append(f"High VOL PCR: {vol_pcr:.3f}")
-            elif vol_pcr < 0.8:
-                if analysis['verdict'] == 'BEARISH':
-                    analysis['score'] += 0.5
-                analysis['reasoning'].append(f"Low VOL PCR: {vol_pcr:.3f}")
-            
-            return analysis
-        except Exception as e:
-            logger.error(f"Basic snapshot analysis error: {e}")
-            return {'verdict': 'NEUTRAL', 'score': 0.0, 'reasoning': ['Analysis failed'], 'error': True}
+        """Basic market snapshot analysis - fallback method."""  
+        # Use the same enhanced logic as progressive method
+        return self.analyze_market_snapshot_progressive(snapshot)
+
     
     def generate_progressive_recommendation(self, analysis, market_state, day_profile):
         """Generate progressive trading recommendation."""
@@ -4774,37 +4848,72 @@ class EnhancedStrategyEngine:
         try:
             analysis = {
                 'verdict': 'NEUTRAL',
-                'score': 5.0,
+                'score': 0.0,  # Start at 0.0, not 5.0
                 'reasoning': []
             }
             
-            # Basic PCR analysis
+            # Get all market data
             oi_pcr = snapshot.get('OI_PCR', 1.0)
             vol_pcr = snapshot.get('VOL_PCR', 1.0)
+            ce_oi = snapshot.get('CE_OI', 0)
+            pe_oi = snapshot.get('PE_OI', 0)
+            ce_vol = snapshot.get('CE_VOL', 0)
+            pe_vol = snapshot.get('PE_VOL', 0)
             
-            if oi_pcr > 1.2:
-                analysis['verdict'] = 'BULLISH'
-                analysis['score'] += 1.0
-                analysis['reasoning'].append(f"High OI PCR: {oi_pcr:.3f}")
-            elif oi_pcr < 0.8:
+            base_score = 5.0  # Neutral baseline
+            
+            # Enhanced PCR analysis with your current data
+            if oi_pcr > 1.15:  # Lowered from 1.2 to 1.15
                 analysis['verdict'] = 'BEARISH'
-                analysis['score'] += 1.0
-                analysis['reasoning'].append(f"Low OI PCR: {oi_pcr:.3f}")
+                base_score -= (oi_pcr - 1.0) * 2.0
+                analysis['reasoning'].append(f"Bearish OI PCR: {oi_pcr:.3f}")
+            elif oi_pcr < 0.85:  # More sensitive
+                analysis['verdict'] = 'BULLISH'
+                base_score += (1.0 - oi_pcr) * 4.0
+                analysis['reasoning'].append(f"Bullish OI PCR: {oi_pcr:.3f}")
+                
+            # Volume PCR Analysis (NEW!)
+            if vol_pcr < 0.95:  # CE Vol > PE Vol (bullish)
+                if analysis['verdict'] != 'BEARISH':
+                    analysis['verdict'] = 'BULLISH'
+                base_score += (0.95 - vol_pcr) * 3.0
+                analysis['reasoning'].append(f"Bullish VOL PCR: {vol_pcr:.3f}")
+            elif vol_pcr > 1.05:  # PE Vol > CE Vol (bearish)
+                if analysis['verdict'] != 'BULLISH':
+                    analysis['verdict'] = 'BEARISH'
+                base_score -= (vol_pcr - 1.0) * 3.0
+                analysis['reasoning'].append(f"Bearish VOL PCR: {vol_pcr:.3f}")
+                
+            # High activity boosts (NEW!)
+            total_oi = ce_oi + pe_oi
+            total_vol = ce_vol + pe_vol
             
-            if vol_pcr > 1.2:
-                if analysis['verdict'] == 'BULLISH':
-                    analysis['score'] += 0.5
-                analysis['reasoning'].append(f"High VOL PCR: {vol_pcr:.3f}")
-            elif vol_pcr < 0.8:
-                if analysis['verdict'] == 'BEARISH':
-                    analysis['score'] += 0.5
-                analysis['reasoning'].append(f"Low VOL PCR: {vol_pcr:.3f}")
+            if total_oi > 5000000:  # Your current: 6.15M
+                activity_boost = min((total_oi / 5000000 - 1) * 0.5, 1.5)
+                base_score += activity_boost if analysis['verdict'] == 'BULLISH' else -activity_boost
+                analysis['reasoning'].append(f"High OI activity: {total_oi:,.0f}")
+                
+            if total_vol > 25000000:  # Your current: 47.5M
+                volume_boost = min((total_vol / 25000000 - 1) * 0.3, 1.5)
+                base_score += volume_boost if analysis['verdict'] == 'BULLISH' else -volume_boost
+                analysis['reasoning'].append(f"High volume activity: {total_vol:,.0f}")
             
+            # Final score normalization
+            analysis['score'] = max(0.0, min(10.0, base_score))
+            
+            # Update verdict based on final score
+            if analysis['score'] > 6.0:
+                analysis['verdict'] = 'BULLISH'
+            elif analysis['score'] < 4.0:
+                analysis['verdict'] = 'BEARISH'
+            else:
+                analysis['verdict'] = 'NEUTRAL'
+                
             return analysis
             
         except Exception as e:
             logger.error(f"Progressive snapshot analysis error: {e}")
-            return {'verdict': 'NEUTRAL', 'score': 0.0, 'reasoning': ['Analysis failed'], 'error': True}
+            return {'verdict': 'NEUTRAL', 'score': 5.0, 'reasoning': ['Analysis failed'], 'error': True}
 
 # =============================================================================
 # END OF PATCH
@@ -10427,6 +10536,24 @@ class FiveMinuteCandle:
         spot = close_price
         near_support = abs(spot - support) < 30
         near_resistance = abs(spot - resistance) < 30
+        # Store completed candle OHLC data
+        completed_candle = {
+            'open': candle_open_price,
+            'high': candle_high_price,
+            'low': candle_low_price,
+            'close': spot,
+            'volume': total_volume
+        }
+        self.completed_candles.append(completed_candle)
+        # Analyze patterns
+        if len(self.completed_candles) >= 3:
+            pattern_results = self.pattern_recognizer.analyze_candle_patterns(
+                self.completed_candles[-3:]
+            )
+            if pattern_results['patterns']:
+                pattern_output = self.pattern_recognizer.format_pattern_output(pattern_results)
+                logger.info(pattern_output)
+                send_telegram_msg(pattern_output)
 
         # Candle Type
         total_range = high_price - low_price + 1e-9

@@ -1,0 +1,19 @@
+input,output
+hello,greeting
+hi,greeting
+good morning,greeting
+hey there,greeting
+how are you,status_inquiry
+what's up,status_inquiry
+how do you do,status_inquiry
+goodbye,farewell
+bye,farewell
+see you later,farewell
+farewell,farewell
+what is your name,identity
+who are you,identity
+what can you do,capabilities
+help,help
+I need help,help
+assist me,help
+support,help
